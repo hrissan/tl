@@ -155,14 +155,14 @@ func (sc *serverConnTCP) close(cause error) {
 		sc.mu.Unlock()
 		return
 	}
-	if cause != nil && sc.errHandler != nil {
-		sc.errHandler(cause)
-	}
 	sc.connectionStatus = serverStatusStopped
 	writeQ := sc.writeQ
 	sc.writeQ = nil
 	sc.inFlight -= len(writeQ)
 	sc.mu.Unlock()
+	if cause != nil && sc.errHandler != nil {
+		sc.errHandler(cause) // do not call callbacks under locks
+	}
 	if sc.server.opts.DebugRPC {
 		sc.server.opts.Logf("rpc_debug: %s Close", sc.debugName)
 	}

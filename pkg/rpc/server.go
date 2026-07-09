@@ -311,8 +311,8 @@ func (s *Server) SetEngineShutdownStatus(engineShutdown bool) {
 // Can be called as many times as needed. Does not wait.
 func (s *Server) Shutdown() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.serverStatus >= serverStatusShutdown {
+		s.mu.Unlock()
 		return
 	}
 	s.serverStatus = serverStatusShutdown
@@ -325,12 +325,20 @@ func (s *Server) Shutdown() {
 	}
 	s.listeners = s.listeners[:0]
 
-	for sc := range s.connsTCP {
-		sc.shutdown()
-	}
-
 	for _, transport := range s.transportsUDP {
 		transport.Shutdown()
+	}
+
+	conns := make([]*serverConnTCP, 0, len(s.connsTCP)) // allocation on Close is not a problem
+	for sc := range s.connsTCP {
+		conns = append(conns, sc)
+	}
+	// no new conns cann appear in s.connsTCP.
+	// some conns could be closed/shutdown before we call sc.shutdown() below, but that is NOP
+	s.mu.Unlock()
+
+	for _, sc := range conns {
+		sc.shutdown() // calls SendEmptyResponse, so should not be under server lock
 	}
 }
 
@@ -357,17 +365,22 @@ func (s *Server) Close() error {
 		s.opts.Logf("rpc_debug: Server %sClose will close TCP connections\n", s.debugNameForTests)
 	}
 
-	cause := fmt.Errorf("server Close called")
-
-	for sc := range s.connsTCP {
-		sc.close(cause)
-	}
-
 	for _, transport := range s.transportsUDP {
 		_ = transport.Close()
 	}
 
+	conns := make([]*serverConnTCP, 0, len(s.connsTCP)) // allocation on Close is not a problem
+	for sc := range s.connsTCP {
+		conns = append(conns, sc)
+	}
+	// no new conns cann appear in s.connsTCP.
+	// some conns could be closed/shutdown before we call sc.close() below, but that is NOP
 	s.mu.Unlock()
+
+	cause := fmt.Errorf("server Close called")
+	for _, sc := range conns {
+		sc.close(cause)
+	}
 
 	if s.opts.DebugRPC {
 		s.opts.Logf("rpc_debug: Server %sClose waiting TCP connections to finish\n", s.debugNameForTests)
@@ -598,7 +611,7 @@ func (s *Server) Serve(ln net.Listener) error {
 }
 
 func (s *Server) goHandshake(conn *PacketConn, lnAddr net.Addr) {
-	defer s.connSem.Release(1)
+	// we cannot defer s.connSem.Release(1) here, because we want to call handlers without locked semaphore
 	defer s.protocolStats[protocolTCP].connectionsCurrent.Add(-1) // we have the same value in connSema, but reading from here is faster
 
 	magicHead, flags, err := conn.HandshakeServer(s.opts.cryptoKeys, s.opts.TrustedSubnetGroups, s.opts.ForceEncryption, s.startTime, DefaultPacketTimeout)
@@ -612,6 +625,7 @@ func (s *Server) goHandshake(conn *PacketConn, lnAddr net.Addr) {
 			if len(magicHead) != 0 && s.opts.SocketHijackHandler != nil {
 				pc, buf := conn.HijackConnection()
 				// We do not close connection, ownership is moved to SocketHijackHandler
+				s.connSem.Release(1)
 				s.opts.SocketHijackHandler(&HijackConnection{Magic: append(magicHead, buf...), Conn: pc})
 				return
 			}
@@ -621,6 +635,7 @@ func (s *Server) goHandshake(conn *PacketConn, lnAddr net.Addr) {
 				s.rareLog(&s.lastOtherLog, "rpc: failed to handshake with %s, peer sent(hex) %x, disconnecting: %v", conn.RemoteAddr(), magicHead, err)
 			}
 		}
+		s.connSem.Release(1)
 		if s.opts.ConnErrHandler != nil {
 			s.opts.ConnErrHandler(err)
 		}
@@ -632,9 +647,11 @@ func (s *Server) goHandshake(conn *PacketConn, lnAddr net.Addr) {
 	if flags&FlagP2PHijack != 0 && s.opts.TransportHijackHandler != nil {
 		// at this point goroutine holds no resources, handler is free to use this goroutine for as long as it wishes
 		// server can be in shutdown state, we have no ordering between TransportHijackHandler and server status yet
+		s.connSem.Release(1)
 		s.opts.TransportHijackHandler(conn)
 		return
 	}
+	defer s.connSem.Release(1)
 
 	// contexts of connections are completely separate, they are cancelled individually, when
 	// connection is closed, including in Server.Close().
@@ -698,7 +715,7 @@ func (s *Server) rareLog(last *time.Time, format string, args ...any) {
 
 func (s *Server) acquireWorker() *worker {
 	v, ok := s.workerPool.Get(s.workersSem)
-	if !ok { // closed, must be never. TODO - add panic and test
+	if !ok { // pool closed
 		return nil
 	}
 	if v != nil {
@@ -888,7 +905,7 @@ func (s *Server) handleRequest(ctx context.Context, reqHeaderTip uint32, hctx *H
 		if w != nil {
 			return w, ctx
 		}
-		// otherwise pool is closed and we call synchronously, TODO - check this is impossible
+		// otherwise pool is closed and we call synchronously so receiver will exit and release connSem
 	}
 
 	err = s.callHandler(ctx, hctx)
